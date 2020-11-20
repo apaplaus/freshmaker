@@ -387,9 +387,7 @@ class ContainerImage(dict):
     def resolve(self, lb_instance, children=None):
         """
         Resolves the Container image - populates additional metadata by
-        querying Koji and dist-git.
-
-        Calls self.resolve_commit() and self.resolve_content_sets().
+        querying Koji and lightblue.
         """
         try:
             self.resolve_commit()
@@ -842,7 +840,7 @@ class LightBlue(object):
                     break
             else:
                 log.info(
-                    "Will not rebuild %s because there is a modularity mismatch between the RPMs "
+                    "Filtered out %s because there is a modularity mismatch between the RPMs "
                     "from the image and the advisory: %r" % (
                         image.nvr, rpm_name_to_nvrs.values()))
         return ret
@@ -1332,18 +1330,17 @@ class LightBlue(object):
             # Constructs the temporary dicts as described above.
             for image_id, images in enumerate(to_rebuild):
                 for parent_id, image in enumerate(images):
-                    nvr = image.nvr
                     image_group = self.describe_image_group(image)
-                    if image_group not in image_group_to_nvrs:
-                        image_group_to_nvrs[image_group] = []
-                    if nvr not in image_group_to_nvrs[image_group]:
-                        image_group_to_nvrs[image_group].append(nvr)
-                    if nvr not in nvr_to_coordinates:
-                        nvr_to_coordinates[nvr] = []
-                    nvr_to_coordinates[nvr].append([image_id, parent_id])
-                    nvr_to_image[nvr] = image
-                    if "latest_released" in image and image["latest_released"]:
-                        image_group_to_latest_released_nvr[image_group] = nvr
+
+                    image_group_to_nvrs.setdefault(image_group, [])
+                    if image.nvr not in image_group_to_nvrs[image_group]:
+                        image_group_to_nvrs[image_group].append(image.nvr)
+
+                    nvr_to_coordinates.setdefault(image.nvr, []).append([image_id, parent_id])
+                    nvr_to_image[image.nvr] = image
+
+                    if image.get("latest_released"):
+                        image_group_to_latest_released_nvr[image_group] = image.nvr
 
             # Sort the lists in image_group_to_nvrs dict.
             for image_group in image_group_to_nvrs.keys():
@@ -1364,9 +1361,7 @@ class LightBlue(object):
                 latest_content_sets = []
                 for nvr in reversed(image_group_to_nvrs[image_group]):
                     image = nvr_to_image[nvr]
-                    if ("content_sets" not in image or
-                            not image["content_sets"] or
-                            "content_sets_source" not in image):
+                    if not image.get("content_sets") or "content_sets_source" not in image:
                         image["content_sets"] = latest_content_sets
                     elif image["content_sets_source"] == "child_image":
                         if latest_content_sets:
@@ -1398,7 +1393,7 @@ class LightBlue(object):
                 if phase == "handle_parent_change":
                     # Find out the name of parent image of latest release image.
                     latest_image = nvr_to_image[latest_released_nvr]
-                    if "parent" not in latest_image or not latest_image["parent"]:
+                    if not latest_image.get("parent"):
                         continue
                     latest_parent_nvr_dict = koji.parse_NVR(latest_image["parent"].nvr)
                     latest_parent_name = latest_parent_nvr_dict["name"]
@@ -1408,7 +1403,7 @@ class LightBlue(object):
                     # update its parents according to latest image parents.
                     for nvr in nvrs[latest_released_nvr_index + 1:]:
                         image = nvr_to_image[nvr]
-                        if "parent" not in image or not image["parent"]:
+                        if not image.get("parent"):
                             continue
                         parent_nvr_dict = koji.parse_NVR(image["parent"].nvr)
                         parent_name = parent_nvr_dict["name"]
@@ -1584,5 +1579,249 @@ class LightBlue(object):
         directly_affected_nvrs = {
             image.nvr for image in images if image.get("directly_affected")
         }
+        # Some images that aren't marked as directly affected may have already been fixed
+        # in the latest published version of the image. Use those images instead.
+        self._filter_out_already_fixed_published_images(
+            to_rebuild, directly_affected_nvrs, rpm_nvrs, content_sets
+        )
+
         # Now generate batches from deduplicated list and return it.
         return self._images_to_rebuild_to_batches(to_rebuild, directly_affected_nvrs)
+
+    def _filter_out_already_fixed_published_images(
+        self, to_rebuild, directly_affected_nvrs, rpm_nvrs, content_sets
+    ):
+        """
+        Replace images in ``to_rebuild`` that are not directly affected and have published fixes.
+
+        When an image and its parents in ``to_rebuild`` are not directly affected, it's possible
+        that the image had been rebuilt outside of Freshmaker and published with the fix applied.
+        In this case, Freshmaker should not rebuild the image and its parents. The latest published
+        image is found by filtering by the same name and version but finding the highest release.
+        This approach is seen as slightly less accurate but safer than using the pullspec used
+        in the FROM line of the Dockerfile of the child image.
+
+        :param Iterable to_rebuild: the list of images to rebuild; each element is
+            an iterable with the first element being the child image and each subsequent
+            image being the parent of the previous image
+        :param Iterable directly_affected_nvrs: the set of image NVRs in ``to_rebuild`` that are
+            marked as directly affected
+        :param Iterable rpm_nvrs: the list of RPM NVRs with the fixes in the advisory
+        :param Iterable content_sets: the list of content sets that the RPMs in ``rpm_nvrs`` are
+            released in
+        """
+        for image_group in to_rebuild:
+            # Find the first index in image_group of an image that is not directly
+            # affected with parents that are also not directly affected
+            not_directly_affected_index = None
+            # Skip the first image in the group since it is always directly affected
+            for i, image in enumerate(image_group[1:], start=1):
+                if image.nvr in directly_affected_nvrs:
+                    not_directly_affected_index = None
+                elif not_directly_affected_index is None:
+                    not_directly_affected_index = i
+
+            # The image group does not end with one or more images that are not directly affected
+            if not_directly_affected_index is None:
+                continue
+
+            # Try replacing all the not directly affected images starting from the first one
+            for i in range(not_directly_affected_index, len(image_group)):
+                parent_image = image_group[i]
+                rpm_name_to_nvrs = {kobo.rpmlib.parse_nvr(nvr)["name"]: nvr for nvr in rpm_nvrs}
+                # Get the RPM NVRs that were fixed and apply to the parent image since
+                # get_fixed_published_image will ensure all those RPMs are present
+                parent_applicable_rpm_nvrs = set()
+                if not parent_image.get_rpms():
+                    log.warning(
+                        "The parent image %s does not have an RPM manifest", parent_image.nvr
+                    )
+                    continue
+
+                for rpm in parent_image.get_rpms():
+                    if rpm_name_to_nvrs.get(rpm["name"]):
+                        parent_applicable_rpm_nvrs.add(rpm_name_to_nvrs[rpm["name"]])
+
+                parsed_parent_nvr = kobo.rpmlib.parse_nvr(parent_image.nvr)
+                fixed_published_image = self.get_fixed_published_image(
+                    parsed_parent_nvr["name"],
+                    parsed_parent_nvr["version"],
+                    self.describe_image_group(parent_image),
+                    parent_applicable_rpm_nvrs,
+                    content_sets,
+                )
+                if fixed_published_image:
+                    # The index to start replacements at should be set to i.
+                    # If this was the first iteration of the for loop, it would
+                    # have already been set to this value.
+                    not_directly_affected_index = i
+                    break
+            else:
+                # After all that, there is no published image with the fix  :'(
+                continue
+
+            log.info(
+                "The image %s will be replaced with the latest published image of %s",
+                image.nvr,
+                fixed_published_image.nvr
+            )
+            # On the first iteration, this is the last directly affected image in image_group
+            child_image = image_group[i - 1]
+            # Replace the parent of child_image with the fixed published parent image
+            # and then remove the remaining images after it in `to_rebuild`
+            child_image["parent"] = fixed_published_image
+            del image_group[not_directly_affected_index:]
+
+    @region.cache_on_arguments()
+    def get_fixed_published_image(self, name, version, image_group, rpm_nvrs, content_sets):
+        """
+        Find a published image with the name, version, and patched RPMs.
+
+        Rather than pass in the original image as a `ContainerImage` object, separate primitives
+        are used to make caching better.
+
+        :param str name: the name of the original image to base the search on
+        :param str version: the version of the original image to base the search on
+        :param str image_group: the image group of the original image determined by the
+            ``describe_image_group`` method
+        :param Iterable rpm_nvrs: the set of binary RPM NVRs that are present or are older than what
+            is present in the image
+        :param Iterable content_sets: the list of content sets that ``rpm_nvrs`` are in
+        :return: a resolved ``ContainerImage`` object representing the fixed published image or
+            ``None``
+        :rtype: ContainerImage or None
+        """
+        rpm_name_to_nvrs = {kobo.rpmlib.parse_nvr(nvr)["name"]: nvr for nvr in rpm_nvrs}
+        # It is too slow to also filter by the expected RPMs. This is done outside of the lightblue
+        # query instead.
+        request = {
+            "objectType": "containerImage",
+            "query": {
+                "$and": [
+                    {
+                        "field": "brew.package", "op": "=", "rvalue": name
+                    },
+                    {
+                        "field": "brew.build", "regex": f"{name}-{version}-.*"
+                    },
+                    {
+                        "$or": [
+                            {
+                                "field": "content_sets.*",
+                                "op": "=",
+                                "rvalue": content_set
+                            }
+                            for content_set in content_sets
+                        ]
+                    },
+                    {
+                        "field": "repositories.*.published",
+                        "op": "=",
+                        "rvalue": True,
+                    },
+                ]
+            },
+            # Start with a small projection and increase it once a fixed image is found by
+            # querying by the NVR with the default projection
+            "projection": [
+                {"field": "brew.build", "include": True},
+                {
+                    "field": "rpm_manifest.*.rpms",
+                    "include": True,
+                    "match": {
+                        "$or": [
+                            {
+                                "field": "name",
+                                "op": "=",
+                                "rvalue": rpm_name
+                            } for rpm_name in rpm_name_to_nvrs.keys()
+                        ]
+                    },
+                    "project": [
+                        {"field": "nvra", "include": True},
+                        {"field": "name", "include": True},
+                    ]
+                },
+                {"field": "repositories.*.repository", "include": True, "recursive": True},
+                {"field": "content_sets", "include": True, "recursive": True},
+            ]
+        }
+        images = self.find_container_images(request)
+        if not images:
+            log.error("Could not find an image with the name and version of %s-%s", name, version)
+            return
+
+        candidate_images = []
+        for image in images:
+            # If it's not on the same repositories or the regex matched something unexpected, then
+            # skip it
+            candidate_image_group = self.describe_image_group(image)
+            if candidate_image_group != image_group:
+                log.debug(
+                    "The image %s did not have the correct image group (%s != %s)",
+                    image.nvr,
+                    candidate_image_group,
+                    image,
+                )
+                continue
+
+            # Due to filtering by installed RPMs taking too long in lightblue, perform the filter
+            # here since the projection (returned RPM manifest from lightblue) has the filtering
+            # applied. This is to be conservative in the event a child image relies on the RPM but
+            # it is no longer installed
+            if {rpm["name"] for rpm in image.get_rpms() or []} != rpm_name_to_nvrs.keys():
+                log.debug("The image %s does not contain all the expected RPMs", image.nvr)
+                continue
+
+            if not self.filter_out_modularity_mismatch([image], rpm_name_to_nvrs):
+                log.debug("The image %s has a modularity mismatch", image.nvr)
+                continue
+
+            for rpm in image.get_rpms():
+                nvr_in_image = kobo.rpmlib.parse_nvra(rpm["nvra"])
+                fixed_nvr = kobo.rpmlib.parse_nvr(rpm_name_to_nvrs[rpm["name"]])
+                if kobo.rpmlib.compare_nvr(nvr_in_image, fixed_nvr, ignore_epoch=True) < 0:
+                    log.debug("The image %s does not have all the fixed RPMs", image.nvr)
+                    break
+            else:
+                candidate_images.append(image)
+
+        # Remove the images list from memory since this can be quite large
+        del images
+
+        if not candidate_images:
+            log.debug(
+                "No fixed published image was found for the name and version %s-%s", name, version
+            )
+            return
+
+        # At this point, there is at least one published image with the fixed RPMs and content sets.
+        # The next step is to pick the one with the highest release.
+        fixed_published_image = candidate_images[0]
+        parsed_fixed_published_image_nvr = kobo.rpmlib.parse_nvr(fixed_published_image.nvr)
+        for candidate_image in candidate_images[1:]:
+            parsed_candidate_image_nvr = kobo.rpmlib.parse_nvr(candidate_image.nvr)
+            if (
+                kobo.rpmlib.compare_nvr(parsed_candidate_image_nvr, parsed_fixed_published_image_nvr) > 0
+            ):
+                fixed_published_image = candidate_image
+
+        # Now that the best fixed published image is determined, get it from lightblue with all the
+        # metadata required by Freshmaker
+        request = {
+            "objectType": "containerImage",
+            "query": {
+                "$and": [{"field": "brew.build", "op": "=", "rvalue": fixed_published_image.nvr}],
+            },
+            "projection": self._get_default_projection(rpm_names=rpm_name_to_nvrs.keys()),
+        }
+        images = self.find_container_images(request)
+        if not images:
+            log.error(
+                "The image with the NVR %s was not found in lightblue", fixed_published_image.nvr
+            )
+            return
+
+        image = images[0]
+        image.resolve(self)
+        return image
